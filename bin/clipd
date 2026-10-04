@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""clipd: expose the macOS clipboard on 127.0.0.1 so a remote host can reach it over an SSH RemoteForward.
+
+Runs on the Mac. Every request must carry the shared token in the X-Clip-Token header.
+
+  clipd serve [--port 47777]   run the server (what the LaunchAgent does)
+  clipd token                  print the token (created on first use)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hmac
+import os
+import secrets
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+DEFAULT_PORT = 47777
+MAX_PUSH_BYTES = 10 * 1024 * 1024
+CONFIG_DIR = Path(os.environ.get("CLIP_OVER_SSH_HOME", Path.home() / ".config" / "clip-over-ssh"))
+TOKEN_FILE = CONFIG_DIR / "token"
+
+
+class MacClipboard:
+    """Reads and writes the macOS pasteboard using only built-in tools."""
+
+    _PNG_SCRIPT = 'try\nreturn (the clipboard as «class PNGf»)\non error\nreturn ""\nend try'
+
+    def read_png(self) -> bytes | None:
+        out = subprocess.run(
+            ["osascript", "-e", self._PNG_SCRIPT], capture_output=True, text=True, timeout=15
+        ).stdout.strip()
+        prefix = "«data PNGf"
+        if not out.startswith(prefix) or not out.endswith("»"):
+            return None
+        return bytes.fromhex(out[len(prefix):-1])
+
+    def read_text(self) -> str | None:
+        out = subprocess.run(["pbpaste"], capture_output=True, timeout=5).stdout
+        return out.decode("utf-8", "replace") if out else None
+
+    def write_text(self, text: str) -> None:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+
+
+def load_token(create: bool = True) -> str:
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+    if not create:
+        raise SystemExit(f"no token at {TOKEN_FILE}")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    token = secrets.token_urlsafe(32)
+    TOKEN_FILE.write_text(token + "\n")
+    TOKEN_FILE.chmod(0o600)
+    return token
+
+
+class ClipHandler(BaseHTTPRequestHandler):
+    server_version = "clipd"
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib signature
+        pass
+
+    def _authorized(self) -> bool:
+        sent = self.headers.get("X-Clip-Token", "")
+        return hmac.compare_digest(sent.encode(), self.server.token.encode())
+
+    def _reply(self, code: int, body: bytes = b"", content_type: str = "text/plain; charset=utf-8") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if not self._authorized():
+            return self._reply(401, b"bad token\n")
+        clipboard = self.server.clipboard
+        if self.path == "/health":
+            return self._reply(200, b"ok\n")
+        if self.path == "/png":
+            png = clipboard.read_png()
+            return self._reply(200, png, "image/png") if png else self._reply(204)
+        if self.path == "/text":
+            text = clipboard.read_text()
+            return self._reply(200, text.encode("utf-8")) if text else self._reply(204)
+        return self._reply(404, b"not found\n")
+
+    def do_POST(self) -> None:
+        if not self._authorized():
+            return self._reply(401, b"bad token\n")
+        if self.path != "/text":
+            return self._reply(404, b"not found\n")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_PUSH_BYTES:
+            return self._reply(413, b"too large\n")
+        self.server.clipboard.write_text(self.rfile.read(length).decode("utf-8", "replace"))
+        return self._reply(204)
+
+
+class ClipServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, port: int, token: str, clipboard: object) -> None:
+        super().__init__(("127.0.0.1", port), ClipHandler)
+        self.token = token
+        self.clipboard = clipboard
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="clipd", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    serve = sub.add_parser("serve", help="run the clipboard server")
+    serve.add_argument("--port", type=int, default=int(os.environ.get("CLIP_OVER_SSH_PORT", DEFAULT_PORT)))
+    sub.add_parser("token", help="print the shared token")
+    args = parser.parse_args(argv)
+
+    if args.command == "token":
+        print(load_token())
+        return 0
+
+    if sys.platform != "darwin":
+        print("clipd serve only runs on macOS", file=sys.stderr)
+        return 1
+    server = ClipServer(args.port, load_token(), MacClipboard())
+    print(f"clipd listening on 127.0.0.1:{args.port}", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

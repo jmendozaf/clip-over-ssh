@@ -1,0 +1,65 @@
+#!/bin/sh
+# clip: use your Mac's clipboard from an SSH session (talks to clipd through a RemoteForward).
+#
+#   clip            save the clipboard image to a PNG and print its path
+#   clip text       print the clipboard text
+#   cmd | clip copy copy stdin to the Mac clipboard
+#   clip status     check the tunnel and token
+#
+# Env: CLIP_OVER_SSH_PORT (47777), CLIP_OVER_SSH_DIR (/tmp/clip), CLIP_OVER_SSH_HOME (~/.config/clip-over-ssh)
+set -eu
+
+port="${CLIP_OVER_SSH_PORT:-47777}"
+dir="${CLIP_OVER_SSH_DIR:-/tmp/clip}"
+home="${CLIP_OVER_SSH_HOME:-$HOME/.config/clip-over-ssh}"
+url="http://127.0.0.1:$port"
+
+die() { echo "clip: $*" >&2; exit "${2:-1}"; }
+
+[ -r "$home/token" ] || die "no token at $home/token (run install.sh remote <host> on your Mac)"
+token=$(cat "$home/token")
+
+request() {
+    # request <method> <path> [curl args...]; prints HTTP status, body goes where the caller says
+    method=$1 path=$2; shift 2
+    curl -sS --max-time 15 -X "$method" -H "X-Clip-Token: $token" -w '%{http_code}' "$@" "$url$path" \
+        || die "no tunnel on 127.0.0.1:$port (is your Mac connected with RemoteForward $port and clipd running?)"
+}
+
+case "${1:-png}" in
+    png)
+        mkdir -p "$dir" && chmod 700 "$dir"
+        file="$dir/clip-$(date +%Y%m%d-%H%M%S).png"
+        code=$(request GET /png -o "$file")
+        case "$code" in
+            200) echo "$file" ;;
+            204) rm -f "$file"; die "the Mac clipboard has no image" 2 ;;
+            401) rm -f "$file"; die "token rejected (re-run install.sh remote <host>)" ;;
+            *) rm -f "$file"; die "HTTP $code" ;;
+        esac
+        ;;
+    text)
+        tmp=$(mktemp)
+        code=$(request GET /text -o "$tmp")
+        case "$code" in
+            200) cat "$tmp"; rm -f "$tmp" ;;
+            204) rm -f "$tmp"; die "the Mac clipboard has no text" 2 ;;
+            *) rm -f "$tmp"; die "HTTP $code" ;;
+        esac
+        ;;
+    copy)
+        code=$(request POST /text --data-binary @- -o /dev/null)
+        [ "$code" = 204 ] || die "HTTP $code"
+        ;;
+    status)
+        code=$(request GET /health -o /dev/null)
+        [ "$code" = 200 ] || die "HTTP $code"
+        echo "ok: clipd reachable on 127.0.0.1:$port"
+        ;;
+    -h|--help|help)
+        sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *)
+        die "unknown command '$1' (try: clip --help)"
+        ;;
+esac
